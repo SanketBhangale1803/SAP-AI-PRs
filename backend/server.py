@@ -181,6 +181,7 @@ def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, 
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.end_headers()
     handler.wfile.write(encoded)
+    
 
 
 def build_auth_header(config: dict[str, Any]) -> str:
