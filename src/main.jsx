@@ -58,9 +58,10 @@ const emptySapSession = {
 const processSteps = [
   { id: 'identity', label: 'Identity', detail: 'Employee and manager resolved' },
   { id: 'intake', label: 'Intake', detail: 'Request captured' },
-  { id: 'policy', label: 'Policy', detail: 'Accounting and risk checked' },
+  { id: 'policy', label: 'Policy', detail: 'Caps, duplicates, risk' },
   { id: 'approval', label: 'Approval', detail: 'Manager decision in SAP Build' },
-  { id: 'sap', label: 'SAP', detail: 'Workflow instance created' }
+  { id: 'sap', label: 'SAP', detail: 'Workflow instance created' },
+  { id: 'history', label: 'History', detail: 'Ledger status loop' }
 ];
 
 function App() {
@@ -68,11 +69,15 @@ function App() {
   const [requester, setRequester] = useState(emptyRequester);
   const [requestText, setRequestText] = useState(sampleRequests[0]);
   const [draft, setDraft] = useState(null);
+  const [validation, setValidation] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [historyStats, setHistoryStats] = useState(null);
   const [sapStatus, setSapStatus] = useState(null);
   const [connectionResult, setConnectionResult] = useState(null);
   const [submitResult, setSubmitResult] = useState(null);
   const [activeStep, setActiveStep] = useState('identity');
   const [isDrafting, setIsDrafting] = useState(false);
+  const [isValidating, setIsValidating] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [error, setError] = useState('');
@@ -107,15 +112,43 @@ function App() {
       }
     }
 
+    async function loadHistory() {
+      try {
+        const response = await fetch(`${API_BASE}/api/requisitions?limit=12`);
+        const data = await response.json();
+        if (!ignore && response.ok) {
+          setHistory(data.items || []);
+          setHistoryStats(data.stats || null);
+        }
+      } catch {
+        // History is optional while the backend is offline.
+      }
+    }
+
     loadStatus();
+    loadHistory();
     return () => {
       ignore = true;
     };
   }, []);
 
+  async function refreshHistory() {
+    try {
+      const response = await fetch(`${API_BASE}/api/requisitions?limit=12`);
+      const data = await response.json();
+      if (response.ok) {
+        setHistory(data.items || []);
+        setHistoryStats(data.stats || null);
+      }
+    } catch {
+      // Ignore transient history refresh failures.
+    }
+  }
+
   function updateRequester(field, value) {
     setRequester((current) => ({ ...current, [field]: value }));
     setDraft(null);
+    setValidation(null);
     setSubmitResult(null);
     setActiveStep('identity');
   }
@@ -137,6 +170,27 @@ function App() {
     setActiveStep('identity');
   }
 
+  async function validateRequest() {
+    setIsValidating(true);
+    setError('');
+    setValidation(null);
+    setActiveStep('policy');
+    try {
+      const response = await fetch(`${API_BASE}/api/requisition/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: requestText, requester })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `Backend returned ${response.status}`);
+      setValidation(data);
+    } catch (err) {
+      setError(err.message || 'Could not validate the request.');
+    } finally {
+      setIsValidating(false);
+    }
+  }
+
   async function createDraft() {
     setIsDrafting(true);
     setError('');
@@ -151,7 +205,9 @@ function App() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `Backend returned ${response.status}`);
       setDraft(data);
+      setValidation(null);
       setActiveStep('policy');
+      await refreshHistory();
     } catch (err) {
       setError(err.message || 'Could not build a requisition draft.');
     } finally {
@@ -173,6 +229,7 @@ function App() {
       const data = await response.json();
       setSubmitResult({ ok: response.ok, ...data });
       if (response.ok) setActiveStep('approval');
+      await refreshHistory();
     } catch {
       setSubmitResult({
         ok: false,
@@ -230,12 +287,16 @@ function App() {
       <section className="main-workspace">
         <header className="workspace-header">
           <div>
-            <p className="eyebrow">Enterprise requisition intake</p>
+            <p className="eyebrow">Enterprise requisition intake · v2 policy + ledger</p>
             <h1>Purchase request cockpit</h1>
           </div>
           <div className="header-actions">
             <StatusPill tone={identityReady ? 'good' : 'warn'} label={identityReady ? 'Employee resolved' : 'Identity needed'} />
             <StatusPill tone={sapReady ? 'good' : 'warn'} label={sapReady ? 'SAP ready' : 'SAP blocked'} />
+            <StatusPill
+              tone={historyStats?.total_records ? 'good' : 'neutral'}
+              label={historyStats?.total_records ? `${historyStats.total_records} in ledger` : 'Ledger empty'}
+            />
           </div>
         </header>
 
@@ -309,9 +370,19 @@ function App() {
                 </button>
               ))}
             </div>
-            <button className="primary-button" onClick={createDraft} disabled={!identityReady || isDrafting}>
-              {isDrafting ? 'Building controlled draft...' : 'Generate controlled draft'}
-            </button>
+            <div className="action-row">
+              <button
+                className="secondary-button"
+                onClick={validateRequest}
+                disabled={!identityReady || isValidating}
+              >
+                {isValidating ? 'Running policy gate...' : 'Validate policy'}
+              </button>
+              <button className="primary-button" onClick={createDraft} disabled={!identityReady || isDrafting}>
+                {isDrafting ? 'Building controlled draft...' : 'Generate controlled draft'}
+              </button>
+            </div>
+            {validation ? <ValidationBox validation={validation} /> : null}
             {error ? <p className="notice error">{error}</p> : null}
           </section>
 
@@ -326,6 +397,8 @@ function App() {
             identityReady={identityReady}
           />
         </section>
+
+        <HistoryPanel history={history} stats={historyStats} onRefresh={refreshHistory} />
       </section>
     </main>
   );
@@ -382,6 +455,27 @@ function DraftPanel({ draft, blockers, canSubmit, isSubmitting, submitResult, on
         </div>
       </div>
 
+      {draft.account_assignment?.budget_cap ? (
+        <p className="notice">
+          Cost center soft cap: {formatCurrency(draft.account_assignment.budget_cap)}
+        </p>
+      ) : null}
+
+      {Array.isArray(draft.duplicates) && draft.duplicates.length > 0 ? (
+        <div className="section-block">
+          <h3>Possible duplicates</h3>
+          <div className="line-list">
+            {draft.duplicates.map((hit) => (
+              <div key={hit.requisition_id} className="line-row">
+                <span>{hit.status}</span>
+                <strong>{hit.requisition_id}</strong>
+                <em>{hit.title}</em>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       <div className="alert-stack">
         {draft.risk.flags.map((flag) => (
           <div key={flag} className="alert-line">
@@ -411,6 +505,60 @@ function DraftPanel({ draft, blockers, canSubmit, isSubmitting, submitResult, on
         <span>Employee and approver fields are included for routing.</span>
       </div>
       <pre>{JSON.stringify(draft.sap_payload, null, 2)}</pre>
+    </section>
+  );
+}
+
+function ValidationBox({ validation }) {
+  return (
+    <div className={validation.valid ? 'result-box success' : 'result-box warning'}>
+      <strong>{validation.valid ? 'Policy gate passed' : 'Policy gate blocked'}</strong>
+      <p>
+        Risk {validation.risk?.level || 'n/a'} ·{' '}
+        {validation.submission_blockers?.length
+          ? validation.submission_blockers.join(' ')
+          : 'No submission blockers detected.'}
+      </p>
+      {validation.budget_cap ? <small>Budget cap {formatCurrency(validation.budget_cap)}</small> : null}
+    </div>
+  );
+}
+
+function HistoryPanel({ history, stats, onRefresh }) {
+  return (
+    <section className="panel history-panel">
+      <div className="draft-heading">
+        <PanelTitle eyebrow="Ledger" title="Requisition history" />
+        <button className="secondary-button" type="button" onClick={onRefresh}>
+          Refresh
+        </button>
+      </div>
+      {stats ? (
+        <p className="notice">
+          {stats.total_records} total ·{' '}
+          {Object.entries(stats.by_status || {})
+            .map(([status, count]) => `${count} ${status}`)
+            .join(' · ') || 'no statuses yet'}
+        </p>
+      ) : null}
+      {history.length === 0 ? (
+        <div className="empty-copy">
+          <strong>No ledger entries yet</strong>
+          <p>Generated drafts and SAP submissions appear here for status tracking and duplicate detection.</p>
+        </div>
+      ) : (
+        <div className="line-list">
+          {history.map((item) => (
+            <div key={item.requisition_id} className="line-row">
+              <span>{item.status}</span>
+              <strong>{item.requisition_id}</strong>
+              <em>
+                {item.title} · {formatCurrency(item.total_estimated_value)} · CC {item.cost_center}
+              </em>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
